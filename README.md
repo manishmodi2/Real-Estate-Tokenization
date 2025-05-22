@@ -1,5 +1,3 @@
-wallet address:0xceb6684c03770f89255522f0f7192c5ab6d1a1c8
-
 # 🏠 Real Estate Tokenization
 
 <div align="center">
