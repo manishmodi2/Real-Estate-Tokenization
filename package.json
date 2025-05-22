@@ -1,27 +1,30 @@
 {
-  "name": "Project-Title",
+  "name": "real-estate-tokenization",
   "version": "1.0.0",
-  "description": "",
+  "description": "A blockchain-based real estate tokenization platform enabling fractional ownership of properties through NFTs",
   "main": "index.js",
   "scripts": {
-    "test": "npx hardhat test",
-    "compile": "npx hardhat compile",
-    "deploy": "npx hardhat run scripts/deploy.js --network coreTestnet"
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.js --network core_testnet2",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "blockchain",
+    "solidity",
+    "real-estate",
+    "tokenization",
+    "nft",
+    "defi"
+  ],
+  "author": "Real Estate Tokenization Team",
   "license": "MIT",
   "devDependencies": {
-    "@nomicfoundation/hardhat-toolbox": "^2.0.2",
-    "@nomiclabs/hardhat-ethers": "^2.0.0",
-    "@nomiclabs/hardhat-waffle": "^2.0.0",
-    "chai": "^4.3.7",
-    "dotenv": "^16.0.3",
-    "ethereum-waffle": "^3.0.0",
-    "ethers": "^5.0.0",
-    "hardhat": "^2.14.0"
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0"
   },
   "dependencies": {
-    "@openzeppelin/contracts": "^4.8.3"
+    "@openzeppelin/contracts": "^5.0.0",
+    "dotenv": "^16.3.1"
   }
-} 
+}
