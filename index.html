@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real Estate Tokenization Platform</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <div class="nav-logo">
+                <i class="fas fa-building"></i>
+                <span>RealEstateToken</span>
+            </div>
+            <ul class="nav-menu">
+                <li><a href="#home" class="nav-link">Home</a></li>
+                <li><a href="#properties" class="nav-link">Properties</a></li>
+                <li><a href="#tokenize" class="nav-link">Tokenize</a></li>
+                <li><a href="#marketplace" class="nav-link">Marketplace</a></li>
+                <li><a href="#about" class="nav-link">About</a></li>
+            </ul>
+            <div class="nav-actions">
+                <button class="btn-wallet" id="connectWallet">
+                    <i class="fas fa-wallet"></i>
+                    Connect Wallet
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <section id="home" class="hero">
+        <div class="hero-content">
+            <h1>Tokenize Real Estate Investments</h1>
+            <p>Fractional ownership of premium properties through blockchain technology</p>
+            <div class="hero-stats">
+                <div class="stat">
+                    <h3>$50M+</h3>
+                    <p>Total Value Tokenized</p>
+                </div>
+                <div class="stat">
+                    <h3>250+</h3>
+                    <p>Properties Listed</p>
+                </div>
+                <div class="stat">
+                    <h3>10,000+</h3>
+                    <p>Investors</p>
+                </div>
+            </div>
+            <button class="btn-primary" id="exploreProperties">
+                Explore Properties
+            </button>
+        </div>
+    </section>
+
+    <!-- Properties Section -->
+    <section id="properties" class="properties">
+        <div class="container">
+            <h2>Featured Properties</h2>
+            <div class="properties-grid" id="propertiesGrid">
+                <!-- Properties will be loaded dynamically -->
+            </div>
+        </div>
+    </section>
+
+    <!-- Tokenization Section -->
+    <section id="tokenize" class="tokenize">
+        <div class="container">
+            <h2>Tokenize Your Property</h2>
+            <div class="tokenize-form">
+                <div class="form-group">
+                    <label for="propertyAddress">Property Address</label>
+                    <input type="text" id="propertyAddress" placeholder="Enter property address">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="propertyValue">Property Value ($)</label>
+                        <input type="number" id="propertyValue" placeholder="Estimated value">
+                    </div>
+                    <div class="form-group">
+                        <label for="tokensSupply">Number of Tokens</label>
+                        <input type="number" id="tokensSupply" placeholder="Total tokens to issue">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="propertyDocuments">Property Documents</label>
+                    <input type="file" id="propertyDocuments" accept=".pdf,.doc,.docx">
+                </div>
+                <button class="btn-primary" id="tokenizeProperty">Tokenize Property</button>
+            </div>
+        </div>
+    </section>
+
+    <!-- Marketplace Section -->
+    <section id="marketplace" class="marketplace">
+        <div class="container">
+            <h2>Token Marketplace</h2>
+            <div class="marketplace-filters">
+                <select id="filterProperty">
+                    <option value="">All Properties</option>
+                </select>
+                <select id="filterPrice">
+                    <option value="">Price Range</option>
+                    <option value="0-100">$0 - $100</option>
+                    <option value="100-500">$100 - $500</option>
+                    <option value="500-1000">$500 - $1,000</option>
+                </select>
+            </div>
+            <div class="tokens-grid" id="tokensGrid">
+                <!-- Tokens will be loaded dynamically -->
+            </div>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h3>RealEstateToken</h3>
+                    <p>Revolutionizing real estate investment through blockchain technology.</p>
+                </div>
+                <div class="footer-section">
+                    <h4>Quick Links</h4>
+                    <ul>
+                        <li><a href="#home">Home</a></li>
+                        <li><a href="#properties">Properties</a></li>
+                        <li><a href="#tokenize">Tokenize</a></li>
+                        <li><a href="#marketplace">Marketplace</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Contact</h4>
+                    <p>info@realestatetoken.com</p>
+                    <p>+1 (555) 123-4567</p>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Modals -->
+    <div id="walletModal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3>Connect Wallet</h3>
+            <div class="wallet-options">
+                <button class="wallet-btn" id="metamaskBtn">
+                    <i class="fab fa-ethereum"></i>
+                    MetaMask
+                </button>
+                <button class="wallet-btn" id="walletConnectBtn">
+                    <i class="fas fa-wallet"></i>
+                    WalletConnect
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/web3@1.7.0/dist/web3.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
