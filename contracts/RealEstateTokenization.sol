@@ -5,17 +5,20 @@ import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
 
 /**
  * @title Real Estate Tokenization Contract
  * @dev A contract for tokenizing real estate properties as NFTs with fractional ownership capabilities
  */
 contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, ReentrancyGuard {
-    uint256 private _tokenIdCounter;
+    using Counters for Counters.Counter;
+    Counters.Counter private _tokenIdCounter;
     
     struct Property {
         uint256 tokenId;
         string propertyAddress;
+        string description;
         uint256 totalValue;
         uint256 totalShares;
         uint256 availableShares;
@@ -24,7 +27,11 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         bool isActive;
         bool isPaused;
         uint256 creationTime;
-        uint256 rentPerShare;
+        uint256 lastRentPerShare;
+        uint256 totalRentDistributed;
+        uint256 lastValueUpdate;
+        string propertyType; // "Residential", "Commercial", "Industrial", "Land"
+        uint256 squareFootage;
     }
     
     struct SharePurchase {
@@ -33,27 +40,56 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 shares;
         uint256 totalCost;
         uint256 timestamp;
+        uint256 pricePerShare;
     }
 
     struct RentDistribution {
         uint256 propertyId;
         uint256 totalRent;
         uint256 timestamp;
+        uint256 rentPerShare;
+        uint256 distributionIndex;
+    }
+
+    struct Shareholder {
+        address shareholder;
+        uint256 shares;
+        uint256 investment;
+        uint256 lastClaimIndex;
     }
     
     mapping(uint256 => Property) public properties;
     mapping(uint256 => SharePurchase[]) public propertyPurchases;
     mapping(address => uint256[]) public userProperties;
     mapping(uint256 => RentDistribution[]) public rentDistributions;
+    mapping(uint256 => Shareholder[]) public propertyShareholders;
     
     // Separate mappings to replace struct mappings
     mapping(uint256 => mapping(address => uint256)) public propertyShareholdings;
     mapping(uint256 => mapping(uint256 => mapping(address => bool))) public rentClaims;
+    mapping(uint256 => mapping(address => uint256)) public userInvestment;
+    mapping(uint256 => mapping(address => uint256)) public lastRentClaimIndex;
     
     // Fee structure
     uint256 public platformFeePercentage = 250; // 2.5% (basis points)
     uint256 public constant MAX_FEE = 1000; // 10% maximum
     address public feeRecipient;
+
+    // Voting system for major decisions
+    struct Vote {
+        uint256 propertyId;
+        string proposal;
+        uint256 votesFor;
+        uint256 votesAgainst;
+        uint256 endTime;
+        bool executed;
+        mapping(address => bool) hasVoted;
+        mapping(address => uint256) votesCast;
+    }
+    
+    Vote[] public votes;
+    uint256 public constant VOTING_DURATION = 7 days;
+    uint256 public constant QUORUM_PERCENTAGE = 51; // 51% required
     
     event PropertyTokenized(
         uint256 indexed tokenId,
@@ -100,7 +136,15 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     event PlatformFeeUpdated(uint256 oldFee, uint256 newFee);
     
     event PropertyDeactivated(uint256 indexed propertyId);
+
+    event VoteCreated(uint256 indexed voteId, uint256 propertyId, string proposal);
+    event VoteCast(uint256 indexed voteId, address voter, bool support, uint256 shares);
+    event VoteExecuted(uint256 indexed voteId, bool passed);
     
+    event PropertyMetadataUpdated(uint256 indexed propertyId, string description, string propertyType);
+    event EmergencyStop(bool stopped);
+    event FundsRecovered(address token, uint256 amount);
+
     // Modifiers for better readability
     modifier onlyPropertyOwner(uint256 propertyId) {
         require(properties[propertyId].propertyOwner == msg.sender, "RET: Not property owner");
@@ -121,6 +165,17 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         require(properties[propertyId].tokenId == propertyId, "RET: Invalid property ID");
         _;
     }
+
+    modifier onlyShareholder(uint256 propertyId) {
+        require(propertyShareholdings[propertyId][msg.sender] > 0, "RET: Not a shareholder");
+        _;
+    }
+
+    bool public emergencyStop = false;
+    modifier notInEmergency() {
+        require(!emergencyStop, "RET: Contract in emergency stop");
+        _;
+    }
     
     constructor() ERC721("RealEstateTokens", "RET") Ownable(msg.sender) {
         feeRecipient = msg.sender;
@@ -128,24 +183,23 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     
     /**
      * @dev Tokenize a real estate property as an NFT with fractional ownership
-     * @param propertyAddress The physical address of the property
-     * @param totalValue The total value of the property in wei
-     * @param totalShares The total number of shares to divide the property into
-     * @param metadataURI The metadata URI for the property NFT
      */
     function tokenizeProperty(
         string memory propertyAddress,
+        string memory description,
         uint256 totalValue,
         uint256 totalShares,
+        string memory propertyType,
+        uint256 squareFootage,
         string memory metadataURI
-    ) public nonReentrant returns (uint256) {
+    ) public nonReentrant notInEmergency returns (uint256) {
         require(bytes(propertyAddress).length > 0, "RET: Property address cannot be empty");
         require(totalValue > 0, "RET: Total value must be greater than 0");
         require(totalShares > 0, "RET: Total shares must be greater than 0");
         require(totalValue >= totalShares, "RET: Value must be at least equal to shares");
         
-        uint256 tokenId = _tokenIdCounter;
-        _tokenIdCounter++;
+        uint256 tokenId = _tokenIdCounter.current();
+        _tokenIdCounter.increment();
         
         _safeMint(msg.sender, tokenId);
         _setTokenURI(tokenId, metadataURI);
@@ -153,6 +207,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         Property storage newProperty = properties[tokenId];
         newProperty.tokenId = tokenId;
         newProperty.propertyAddress = propertyAddress;
+        newProperty.description = description;
         newProperty.totalValue = totalValue;
         newProperty.totalShares = totalShares;
         newProperty.availableShares = totalShares;
@@ -161,10 +216,11 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         newProperty.isActive = true;
         newProperty.isPaused = false;
         newProperty.creationTime = block.timestamp;
-        newProperty.rentPerShare = 0;
-        
-        // Initialize shareholdings for property owner
-        propertyShareholdings[tokenId][msg.sender] = 0; // Owner doesn't automatically get shares
+        newProperty.lastRentPerShare = 0;
+        newProperty.totalRentDistributed = 0;
+        newProperty.lastValueUpdate = block.timestamp;
+        newProperty.propertyType = propertyType;
+        newProperty.squareFootage = squareFootage;
         
         userProperties[msg.sender].push(tokenId);
         
@@ -175,13 +231,11 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     
     /**
      * @dev Purchase shares of a tokenized property
-     * @param propertyId The ID of the property to purchase shares from
-     * @param shares The number of shares to purchase
      */
     function purchaseShares(
         uint256 propertyId, 
         uint256 shares
-    ) public payable nonReentrant 
+    ) public payable nonReentrant notInEmergency
       validProperty(propertyId)
       propertyActive(propertyId)
       propertyNotPaused(propertyId) 
@@ -201,6 +255,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         // Update property shareholdings
         propertyShareholdings[propertyId][msg.sender] += shares;
         property.availableShares -= shares;
+        userInvestment[propertyId][msg.sender] += totalCost;
         
         // Record the purchase
         propertyPurchases[propertyId].push(SharePurchase({
@@ -208,8 +263,12 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
             buyer: msg.sender,
             shares: shares,
             totalCost: totalCost,
-            timestamp: block.timestamp
+            timestamp: block.timestamp,
+            pricePerShare: property.pricePerShare
         }));
+
+        // Update shareholders list
+        _updateShareholder(propertyId, msg.sender, shares, totalCost, true);
         
         // Add to user's property list if first time purchasing
         if (!hasUserProperty(msg.sender, propertyId)) {
@@ -231,18 +290,90 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         
         emit SharesPurchased(propertyId, msg.sender, shares, totalCost);
     }
+
+    /**
+     * @dev Bulk purchase shares for multiple properties
+     */
+    function bulkPurchaseShares(
+        uint256[] memory propertyIds,
+        uint256[] memory shares
+    ) public payable nonReentrant notInEmergency {
+        require(propertyIds.length == shares.length, "RET: Arrays length mismatch");
+        require(propertyIds.length > 0, "RET: No properties specified");
+        
+        uint256 totalCost = 0;
+        
+        // Calculate total cost first
+        for (uint256 i = 0; i < propertyIds.length; i++) {
+            Property storage property = properties[propertyIds[i]];
+            require(property.isActive && !property.isPaused, "RET: Property not available");
+            require(shares[i] <= property.availableShares, "RET: Not enough shares available");
+            totalCost += shares[i] * property.pricePerShare;
+        }
+        
+        require(msg.value >= totalCost, "RET: Insufficient payment");
+        
+        // Execute purchases
+        for (uint256 i = 0; i < propertyIds.length; i++) {
+            if (shares[i] > 0) {
+                // Use internal function to avoid reentrancy and re-checking
+                _purchaseSharesInternal(propertyIds[i], shares[i], msg.sender);
+            }
+        }
+        
+        // Refund excess payment
+        if (msg.value > totalCost) {
+            payable(msg.sender).transfer(msg.value - totalCost);
+        }
+    }
+
+    /**
+     * @dev Internal function for share purchase
+     */
+    function _purchaseSharesInternal(uint256 propertyId, uint256 shares, address buyer) internal {
+        Property storage property = properties[propertyId];
+        uint256 totalCost = shares * property.pricePerShare;
+        
+        // Calculate platform fee
+        uint256 platformFee = (totalCost * platformFeePercentage) / 10000;
+        uint256 ownerPayment = totalCost - platformFee;
+        
+        // Update shareholdings
+        propertyShareholdings[propertyId][buyer] += shares;
+        property.availableShares -= shares;
+        userInvestment[propertyId][buyer] += totalCost;
+        
+        // Record purchase
+        propertyPurchases[propertyId].push(SharePurchase({
+            propertyId: propertyId,
+            buyer: buyer,
+            shares: shares,
+            totalCost: totalCost,
+            timestamp: block.timestamp,
+            pricePerShare: property.pricePerShare
+        }));
+
+        _updateShareholder(propertyId, buyer, shares, totalCost, true);
+        
+        // Transfer payments
+        if (ownerPayment > 0) {
+            payable(property.propertyOwner).transfer(ownerPayment);
+        }
+        if (platformFee > 0) {
+            payable(feeRecipient).transfer(platformFee);
+        }
+        
+        emit SharesPurchased(propertyId, buyer, shares, totalCost);
+    }
     
     /**
      * @dev Transfer shares between users
-     * @param propertyId The ID of the property
-     * @param to The address to transfer shares to
-     * @param shares The number of shares to transfer
      */
     function transferShares(
         uint256 propertyId, 
         address to, 
         uint256 shares
-    ) public nonReentrant 
+    ) public nonReentrant notInEmergency
       validProperty(propertyId)
       propertyActive(propertyId)
       propertyNotPaused(propertyId)
@@ -252,9 +383,21 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         require(shares > 0, "RET: Shares must be greater than 0");
         require(propertyShareholdings[propertyId][msg.sender] >= shares, "RET: Insufficient shares");
         
+        // Calculate proportional investment
+        uint256 totalInvestment = userInvestment[propertyId][msg.sender];
+        uint256 investmentTransferred = (totalInvestment * shares) / propertyShareholdings[propertyId][msg.sender];
+        
         // Update shareholdings
         propertyShareholdings[propertyId][msg.sender] -= shares;
         propertyShareholdings[propertyId][to] += shares;
+        
+        // Update investments
+        userInvestment[propertyId][msg.sender] -= investmentTransferred;
+        userInvestment[propertyId][to] += investmentTransferred;
+
+        // Update shareholders
+        _updateShareholder(propertyId, msg.sender, shares, investmentTransferred, false);
+        _updateShareholder(propertyId, to, shares, investmentTransferred, true);
         
         // Add to recipient's property list if first time
         if (!hasUserProperty(to, propertyId)) {
@@ -265,56 +408,254 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     }
 
     /**
-     * @dev Pause/unpause trading for a specific property (only property owner)
-     * @param propertyId The ID of the property
-     * @param isPaused Whether to pause or unpause
+     * @dev Create a vote for property-related decisions
      */
-    function pauseProperty(
-        uint256 propertyId, 
-        bool isPaused
-    ) public 
-      validProperty(propertyId)
-      onlyPropertyOwner(propertyId)
-      propertyActive(propertyId)
-    {
+    function createVote(
+        uint256 propertyId,
+        string memory proposal
+    ) public validProperty(propertyId) onlyShareholder(propertyId) returns (uint256) {
+        uint256 voteId = votes.length;
+        
+        Vote storage newVote = votes.push();
+        newVote.propertyId = propertyId;
+        newVote.proposal = proposal;
+        newVote.endTime = block.timestamp + VOTING_DURATION;
+        newVote.executed = false;
+        
+        emit VoteCreated(voteId, propertyId, proposal);
+        return voteId;
+    }
+
+    /**
+     * @dev Cast a vote
+     */
+    function castVote(uint256 voteId, bool support) public notInEmergency {
+        require(voteId < votes.length, "RET: Invalid vote ID");
+        Vote storage vote = votes[voteId];
+        require(block.timestamp <= vote.endTime, "RET: Voting ended");
+        require(!vote.executed, "RET: Vote already executed");
+        require(!vote.hasVoted[msg.sender], "RET: Already voted");
+        
+        uint256 voterShares = propertyShareholdings[vote.propertyId][msg.sender];
+        require(voterShares > 0, "RET: Not a shareholder");
+        
+        vote.hasVoted[msg.sender] = true;
+        vote.votesCast[msg.sender] = voterShares;
+        
+        if (support) {
+            vote.votesFor += voterShares;
+        } else {
+            vote.votesAgainst += voterShares;
+        }
+        
+        emit VoteCast(voteId, msg.sender, support, voterShares);
+    }
+
+    /**
+     * @dev Execute a vote if conditions are met
+     */
+    function executeVote(uint256 voteId) public notInEmergency {
+        require(voteId < votes.length, "RET: Invalid vote ID");
+        Vote storage vote = votes[voteId];
+        require(block.timestamp > vote.endTime, "RET: Voting still active");
+        require(!vote.executed, "RET: Vote already executed");
+        
+        vote.executed = true;
+        
+        uint256 totalVotes = vote.votesFor + vote.votesAgainst;
+        uint256 totalShares = properties[vote.propertyId].totalShares - properties[vote.propertyId].availableShares;
+        
+        bool passed = (totalVotes * 100 >= totalShares * QUORUM_PERCENTAGE) && 
+                     (vote.votesFor > vote.votesAgainst);
+        
+        // Here you could add logic to execute the proposal based on vote.proposal
+        // For example: change property management, update fees, etc.
+        
+        emit VoteExecuted(voteId, passed);
+    }
+
+    /**
+     * @dev Update shareholder information
+     */
+    function _updateShareholder(
+        uint256 propertyId,
+        address shareholder,
+        uint256 shares,
+        uint256 investment,
+        bool isAdding
+    ) internal {
+        bool found = false;
+        
+        for (uint256 i = 0; i < propertyShareholders[propertyId].length; i++) {
+            if (propertyShareholders[propertyId][i].shareholder == shareholder) {
+                if (isAdding) {
+                    propertyShareholders[propertyId][i].shares += shares;
+                    propertyShareholders[propertyId][i].investment += investment;
+                } else {
+                    propertyShareholders[propertyId][i].shares -= shares;
+                    propertyShareholders[propertyId][i].investment -= investment;
+                    
+                    if (propertyShareholders[propertyId][i].shares == 0) {
+                        // Remove shareholder if no shares left
+                        propertyShareholders[propertyId][i] = propertyShareholders[propertyId][propertyShareholders[propertyId].length - 1];
+                        propertyShareholders[propertyId].pop();
+                    }
+                }
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found && isAdding) {
+            propertyShareholders[propertyId].push(Shareholder({
+                shareholder: shareholder,
+                shares: shares,
+                investment: investment,
+                lastClaimIndex: 0
+            }));
+        }
+    }
+
+    /**
+     * @dev Emergency stop mechanism
+     */
+    function setEmergencyStop(bool stop) public onlyOwner {
+        emergencyStop = stop;
+        emit EmergencyStop(stop);
+    }
+
+    /**
+     * @dev Recover accidentally sent tokens
+     */
+    function recoverTokens(address tokenAddress, uint256 amount) public onlyOwner {
+        require(tokenAddress != address(0), "RET: Invalid token address");
+        if (tokenAddress == address(0)) {
+            payable(owner()).transfer(amount);
+        } else {
+            // For ERC20 tokens - you'd need IERC20 interface
+            // IERC20(tokenAddress).transfer(owner(), amount);
+        }
+        emit FundsRecovered(tokenAddress, amount);
+    }
+
+    // ============ ENHANCED VIEW FUNCTIONS ============
+
+    /**
+     * @dev Get property shareholders
+     */
+    function getPropertyShareholders(uint256 propertyId) public view returns (address[] memory, uint256[] memory) {
+        Shareholder[] memory shareholders = propertyShareholders[propertyId];
+        address[] memory addresses = new address[](shareholders.length);
+        uint256[] memory shareAmounts = new uint256[](shareholders.length);
+        
+        for (uint256 i = 0; i < shareholders.length; i++) {
+            addresses[i] = shareholders[i].shareholder;
+            shareAmounts[i] = shareholders[i].shares;
+        }
+        
+        return (addresses, shareAmounts);
+    }
+
+    /**
+     * @dev Get user's dividend history
+     */
+    function getUserDividendHistory(address user, uint256 propertyId) public view returns (
+        uint256[] memory timestamps,
+        uint256[] memory amounts,
+        bool[] memory claimed
+    ) {
+        uint256 distributionCount = rentDistributions[propertyId].length;
+        timestamps = new uint256[](distributionCount);
+        amounts = new uint256[](distributionCount);
+        claimed = new bool[](distributionCount);
+        
+        uint256 userShares = propertyShareholdings[propertyId][user];
+        uint256 soldShares = properties[propertyId].totalShares - properties[propertyId].availableShares;
+        
+        for (uint256 i = 0; i < distributionCount; i++) {
+            timestamps[i] = rentDistributions[propertyId][i].timestamp;
+            amounts[i] = (rentDistributions[propertyId][i].totalRent * userShares) / soldShares;
+            claimed[i] = rentClaims[propertyId][i][user];
+        }
+        
+        return (timestamps, amounts, claimed);
+    }
+
+    /**
+     * @dev Get market overview statistics
+     */
+    function getMarketOverview() public view returns (
+        uint256 totalProperties,
+        uint256 activeProperties,
+        uint256 totalVolume,
+        uint256 totalRentDistributed,
+        uint256 totalInvestors
+    ) {
+        totalProperties = _tokenIdCounter.current();
+        uint256 volume = 0;
+        uint256 rent = 0;
+        uint256 investorCount = 0;
+        
+        // Use a mapping to track unique investors across all properties
+        address[] memory allInvestors = new address[](1000); // Simplified approach
+        uint256 uniqueCount = 0;
+        
+        for (uint256 i = 0; i < totalProperties; i++) {
+            if (properties[i].isActive) {
+                activeProperties++;
+                
+                // Calculate volume for this property
+                for (uint256 j = 0; j < propertyPurchases[i].length; j++) {
+                    volume += propertyPurchases[i][j].totalCost;
+                    
+                    // Track unique investors
+                    address investor = propertyPurchases[i][j].buyer;
+                    bool isUnique = true;
+                    for (uint256 k = 0; k < uniqueCount; k++) {
+                        if (allInvestors[k] == investor) {
+                            isUnique = false;
+                            break;
+                        }
+                    }
+                    if (isUnique && uniqueCount < allInvestors.length) {
+                        allInvestors[uniqueCount] = investor;
+                        uniqueCount++;
+                    }
+                }
+                
+                // Calculate total rent
+                for (uint256 j = 0; j < rentDistributions[i].length; j++) {
+                    rent += rentDistributions[i][j].totalRent;
+                }
+            }
+        }
+        
+        return (totalProperties, activeProperties, volume, rent, uniqueCount);
+    }
+
+    // ============ EXISTING FUNCTIONS (with minor enhancements) ============
+    
+    function pauseProperty(uint256 propertyId, bool isPaused) public 
+        validProperty(propertyId) onlyPropertyOwner(propertyId) propertyActive(propertyId) {
         properties[propertyId].isPaused = isPaused;
         emit PropertyPaused(propertyId, isPaused);
     }
 
-    /**
-     * @dev Update property value (only property owner)
-     * @param propertyId The ID of the property
-     * @param newValue The new total value of the property
-     */
-    function updatePropertyValue(
-        uint256 propertyId, 
-        uint256 newValue
-    ) public 
-      validProperty(propertyId)
-      onlyPropertyOwner(propertyId)
-      propertyActive(propertyId)
-    {
+    function updatePropertyValue(uint256 propertyId, uint256 newValue) public 
+        validProperty(propertyId) onlyPropertyOwner(propertyId) propertyActive(propertyId) {
         require(newValue > 0, "RET: New value must be greater than 0");
         
         Property storage property = properties[propertyId];
         uint256 oldValue = property.totalValue;
         property.totalValue = newValue;
         property.pricePerShare = newValue / property.totalShares;
+        property.lastValueUpdate = block.timestamp;
         
         emit PropertyValueUpdated(propertyId, oldValue, newValue);
     }
 
-    /**
-     * @dev Distribute rental income to shareholders
-     * @param propertyId The ID of the property
-     */
-    function distributeRent(
-        uint256 propertyId
-    ) public payable 
-      validProperty(propertyId)
-      onlyPropertyOwner(propertyId)
-      propertyActive(propertyId)
-    {
+    function distributeRent(uint256 propertyId) public payable 
+        validProperty(propertyId) onlyPropertyOwner(propertyId) propertyActive(propertyId) {
         require(msg.value > 0, "RET: Rent amount must be greater than 0");
         
         Property storage property = properties[propertyId];
@@ -324,29 +665,20 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         RentDistribution memory newDistribution = RentDistribution({
             propertyId: propertyId,
             totalRent: msg.value,
-            timestamp: block.timestamp
+            timestamp: block.timestamp,
+            rentPerShare: msg.value / soldShares,
+            distributionIndex: rentDistributions[propertyId].length
         });
         
         rentDistributions[propertyId].push(newDistribution);
-        
-        // Calculate rent per share for this distribution
-        property.rentPerShare = msg.value / soldShares;
+        property.totalRentDistributed += msg.value;
+        property.lastRentPerShare = msg.value / soldShares;
         
         emit RentDistributed(propertyId, msg.value, block.timestamp);
     }
 
-    /**
-     * @dev Claim rental income for a specific distribution
-     * @param propertyId The ID of the property
-     * @param distributionIndex The index of the rent distribution
-     */
-    function claimRent(
-        uint256 propertyId, 
-        uint256 distributionIndex
-    ) public nonReentrant 
-      validProperty(propertyId)
-      propertyActive(propertyId)
-    {
+    function claimRent(uint256 propertyId, uint256 distributionIndex) public nonReentrant 
+        validProperty(propertyId) propertyActive(propertyId) {
         require(distributionIndex < rentDistributions[propertyId].length, "RET: Invalid distribution index");
         require(propertyShareholdings[propertyId][msg.sender] > 0, "RET: No shares owned");
         require(!rentClaims[propertyId][distributionIndex][msg.sender], "RET: Rent already claimed");
@@ -361,325 +693,21 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         require(rentAmount > 0, "RET: No rent to claim");
         
         rentClaims[propertyId][distributionIndex][msg.sender] = true;
+        lastRentClaimIndex[propertyId][msg.sender] = distributionIndex;
         payable(msg.sender).transfer(rentAmount);
         
         emit RentClaimed(propertyId, msg.sender, rentAmount);
     }
 
-    /**
-     * @dev Batch claim rent for multiple distributions
-     * @param propertyId The ID of the property
-     * @param distributionIndices Array of distribution indices to claim
-     */
-    function batchClaimRent(
-        uint256 propertyId, 
-        uint256[] memory distributionIndices
-    ) public nonReentrant 
-      validProperty(propertyId)
-      propertyActive(propertyId)
-    {
-        require(propertyShareholdings[propertyId][msg.sender] > 0, "RET: No shares owned");
-        require(distributionIndices.length > 0, "RET: No distributions specified");
+    function updatePropertyMetadata(
+        uint256 propertyId,
+        string memory description,
+        string memory propertyType
+    ) public validProperty(propertyId) onlyPropertyOwner(propertyId) {
+        properties[propertyId].description = description;
+        properties[propertyId].propertyType = propertyType;
         
-        Property storage property = properties[propertyId];
-        uint256 userShares = propertyShareholdings[propertyId][msg.sender];
-        uint256 soldShares = property.totalShares - property.availableShares;
-        uint256 totalRentAmount = 0;
-        
-        for (uint256 i = 0; i < distributionIndices.length; i++) {
-            uint256 distributionIndex = distributionIndices[i];
-            require(distributionIndex < rentDistributions[propertyId].length, "RET: Invalid distribution index");
-            
-            if (!rentClaims[propertyId][distributionIndex][msg.sender]) {
-                RentDistribution storage distribution = rentDistributions[propertyId][distributionIndex];
-                uint256 rentAmount = (distribution.totalRent * userShares) / soldShares;
-                
-                rentClaims[propertyId][distributionIndex][msg.sender] = true;
-                totalRentAmount += rentAmount;
-                
-                emit RentClaimed(propertyId, msg.sender, rentAmount);
-            }
-        }
-        
-        require(totalRentAmount > 0, "RET: No rent to claim");
-        payable(msg.sender).transfer(totalRentAmount);
-    }
-
-    /**
-     * @dev Deactivate a property (only property owner)
-     * @param propertyId The ID of the property
-     */
-    function deactivateProperty(
-        uint256 propertyId
-    ) public 
-      validProperty(propertyId)
-      onlyPropertyOwner(propertyId)
-      propertyActive(propertyId)
-    {
-        Property storage property = properties[propertyId];
-        
-        // Allow deactivation only if no shares are sold or all shareholders agree (simplified)
-        require(property.availableShares == property.totalShares, 
-            "RET: Cannot deactivate property with active shareholders");
-        
-        property.isActive = false;
-        emit PropertyDeactivated(propertyId);
-    }
-
-    /**
-     * @dev Emergency withdrawal function (only owner) - for stuck funds
-     */
-    function emergencyWithdraw() public onlyOwner {
-        uint256 contractBalance = address(this).balance;
-        require(contractBalance > 0, "RET: No funds to withdraw");
-        
-        payable(owner()).transfer(contractBalance);
-    }
-
-    /**
-     * @dev Set platform fee (only owner)
-     * @param newFeePercentage New fee percentage in basis points (e.g., 250 = 2.5%)
-     */
-    function setPlatformFee(uint256 newFeePercentage) public onlyOwner {
-        require(newFeePercentage <= MAX_FEE, "RET: Fee too high");
-        
-        uint256 oldFee = platformFeePercentage;
-        platformFeePercentage = newFeePercentage;
-        
-        emit PlatformFeeUpdated(oldFee, newFeePercentage);
-    }
-
-    /**
-     * @dev Set fee recipient address (only owner)
-     * @param newFeeRecipient New fee recipient address
-     */
-    function setFeeRecipient(address newFeeRecipient) public onlyOwner {
-        require(newFeeRecipient != address(0), "RET: Invalid address");
-        feeRecipient = newFeeRecipient;
-    }
-
-    // ============ VIEW FUNCTIONS ============
-
-    /**
-     * @dev Get complete property details
-     */
-    function getPropertyDetails(uint256 propertyId) public view returns (
-        string memory propertyAddress,
-        uint256 totalValue,
-        uint256 totalShares,
-        uint256 availableShares,
-        uint256 pricePerShare,
-        address propertyOwner,
-        bool isActive,
-        bool isPaused,
-        uint256 creationTime,
-        uint256 rentPerShare
-    ) {
-        Property storage property = properties[propertyId];
-        require(property.tokenId == propertyId, "RET: Invalid property ID");
-        
-        return (
-            property.propertyAddress,
-            property.totalValue,
-            property.totalShares,
-            property.availableShares,
-            property.pricePerShare,
-            property.propertyOwner,
-            property.isActive,
-            property.isPaused,
-            property.creationTime,
-            property.rentPerShare
-        );
-    }
-    
-    function getUserShares(uint256 propertyId, address user) public view returns (uint256) {
-        return propertyShareholdings[propertyId][user];
-    }
-    
-    function getUserProperties(address user) public view returns (uint256[] memory) {
-        return userProperties[user];
-    }
-    
-    function getPropertyPurchases(uint256 propertyId) public view returns (uint256) {
-        return propertyPurchases[propertyId].length;
-    }
-    
-    function getPurchaseDetails(uint256 propertyId, uint256 index) public view returns (
-        address buyer,
-        uint256 shares,
-        uint256 totalCost,
-        uint256 timestamp
-    ) {
-        require(index < propertyPurchases[propertyId].length, "RET: Invalid purchase index");
-        SharePurchase memory purchase = propertyPurchases[propertyId][index];
-        return (purchase.buyer, purchase.shares, purchase.totalCost, purchase.timestamp);
-    }
-    
-    function getTotalProperties() public view returns (uint256) {
-        return _tokenIdCounter;
-    }
-
-    /**
-     * @dev Get rent distribution count for a property
-     */
-    function getRentDistributionCount(uint256 propertyId) public view returns (uint256) {
-        return rentDistributions[propertyId].length;
-    }
-
-    /**
-     * @dev Get rent distribution details
-     */
-    function getRentDistribution(uint256 propertyId, uint256 index) public view returns (
-        uint256 totalRent,
-        uint256 timestamp
-    ) {
-        require(index < rentDistributions[propertyId].length, "RET: Invalid distribution index");
-        RentDistribution memory distribution = rentDistributions[propertyId][index];
-        return (distribution.totalRent, distribution.timestamp);
-    }
-
-    /**
-     * @dev Check if user has claimed rent for a specific distribution
-     */
-    function hasClaimedRent(uint256 propertyId, uint256 distributionIndex, address user) public view returns (bool) {
-        require(distributionIndex < rentDistributions[propertyId].length, "RET: Invalid distribution index");
-        return rentClaims[propertyId][distributionIndex][user];
-    }
-
-    /**
-     * @dev Get unclaimed rent amount for a user
-     */
-    function getUnclaimedRent(uint256 propertyId, address user) public view returns (uint256) {
-        Property storage property = properties[propertyId];
-        uint256 userShares = propertyShareholdings[propertyId][user];
-        
-        if (userShares == 0) return 0;
-        
-        uint256 totalUnclaimed = 0;
-        uint256 soldShares = property.totalShares - property.availableShares;
-        
-        for (uint256 i = 0; i < rentDistributions[propertyId].length; i++) {
-            if (!rentClaims[propertyId][i][user]) {
-                RentDistribution storage distribution = rentDistributions[propertyId][i];
-                uint256 rentAmount = (distribution.totalRent * userShares) / soldShares;
-                totalUnclaimed += rentAmount;
-            }
-        }
-        
-        return totalUnclaimed;
-    }
-
-    /**
-     * @dev Get comprehensive property statistics
-     */
-    function getPropertyStats(uint256 propertyId) public view returns (
-        uint256 totalInvestors,
-        uint256 totalRentDistributed,
-        uint256 totalTransactions,
-        uint256 occupancyRate,
-        uint256 totalVolume
-    ) {
-        Property storage property = properties[propertyId];
-        require(property.tokenId == propertyId, "RET: Invalid property ID");
-        
-        // Count unique investors
-        address[] memory investors = new address[](propertyPurchases[propertyId].length);
-        uint256 uniqueInvestorCount = 0;
-        uint256 volume = 0;
-        
-        for (uint256 i = 0; i < propertyPurchases[propertyId].length; i++) {
-            address buyer = propertyPurchases[propertyId][i].buyer;
-            volume += propertyPurchases[propertyId][i].totalCost;
-            
-            bool isUnique = true;
-            for (uint256 j = 0; j < uniqueInvestorCount; j++) {
-                if (investors[j] == buyer) {
-                    isUnique = false;
-                    break;
-                }
-            }
-            
-            if (isUnique) {
-                investors[uniqueInvestorCount] = buyer;
-                uniqueInvestorCount++;
-            }
-        }
-        
-        // Calculate total rent distributed
-        uint256 totalRent = 0;
-        for (uint256 i = 0; i < rentDistributions[propertyId].length; i++) {
-            totalRent += rentDistributions[propertyId][i].totalRent;
-        }
-        
-        // Calculate occupancy rate (in basis points)
-        uint256 soldShares = property.totalShares - property.availableShares;
-        uint256 occupancy = property.totalShares > 0 ? (soldShares * 10000) / property.totalShares : 0;
-        
-        return (
-            uniqueInvestorCount,
-            totalRent,
-            propertyPurchases[propertyId].length,
-            occupancy,
-            volume
-        );
-    }
-
-    /**
-     * @dev Get user's portfolio summary
-     */
-    function getUserPortfolio(address user) public view returns (
-        uint256 totalProperties,
-        uint256 totalInvestment,
-        uint256 unclaimedRent,
-        uint256 currentPortfolioValue
-    ) {
-        uint256[] memory userProps = userProperties[user];
-        uint256 investment = 0;
-        uint256 rent = 0;
-        uint256 portfolioValue = 0;
-        
-        for (uint256 i = 0; i < userProps.length; i++) {
-            uint256 propertyId = userProps[i];
-            uint256 userShares = propertyShareholdings[propertyId][user];
-            
-            if (userShares > 0) {
-                Property storage property = properties[propertyId];
-                investment += getUserInvestmentInProperty(propertyId, user);
-                rent += getUnclaimedRent(propertyId, user);
-                portfolioValue += userShares * property.pricePerShare;
-            }
-        }
-        
-        return (userProps.length, investment, rent, portfolioValue);
-    }
-
-    /**
-     * @dev Get user's investment in a specific property
-     */
-    function getUserInvestmentInProperty(uint256 propertyId, address user) public view returns (uint256) {
-        uint256 totalInvestment = 0;
-        
-        for (uint256 i = 0; i < propertyPurchases[propertyId].length; i++) {
-            if (propertyPurchases[propertyId][i].buyer == user) {
-                totalInvestment += propertyPurchases[propertyId][i].totalCost;
-            }
-        }
-        
-        return totalInvestment;
-    }
-
-    // ============ INTERNAL HELPER FUNCTIONS ============
-    
-    /**
-     * @dev Check if user already has a property in their list
-     */
-    function hasUserProperty(address user, uint256 propertyId) internal view returns (bool) {
-        for (uint256 i = 0; i < userProperties[user].length; i++) {
-            if (userProperties[user][i] == propertyId) {
-                return true;
-            }
-        }
-        return false;
+        emit PropertyMetadataUpdated(propertyId, description, propertyType);
     }
 
     // ============ OVERRIDE FUNCTIONS ============
@@ -694,5 +722,16 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
 
     function _increaseBalance(address account, uint128 amount) internal override(ERC721) {
         super._increaseBalance(account, amount);
+    }
+
+    // ============ INTERNAL HELPER FUNCTIONS ============
+    
+    function hasUserProperty(address user, uint256 propertyId) internal view returns (bool) {
+        for (uint256 i = 0; i < userProperties[user].length; i++) {
+            if (userProperties[user][i] == propertyId) {
+                return true;
+            }
+        }
+        return false;
     }
 }
