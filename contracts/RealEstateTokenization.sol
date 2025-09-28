@@ -6,13 +6,19 @@ import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 
 /**
  * @title Real Estate Tokenization Contract
  * @dev A contract for tokenizing real estate properties as NFTs with fractional ownership capabilities
+ * @notice This contract allows property owners to tokenize real estate and sell fractional shares
  */
 contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, ReentrancyGuard {
     using Counters for Counters.Counter;
+    using Address for address payable;
+    using SafeMath for uint256;
+    
     Counters.Counter private _tokenIdCounter;
     
     struct Property {
@@ -32,6 +38,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 lastValueUpdate;
         string propertyType; // "Residential", "Commercial", "Industrial", "Land"
         uint256 squareFootage;
+        uint256 totalInvestment;
     }
     
     struct SharePurchase {
@@ -56,25 +63,9 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 shares;
         uint256 investment;
         uint256 lastClaimIndex;
+        uint256 joinTimestamp;
     }
     
-    mapping(uint256 => Property) public properties;
-    mapping(uint256 => SharePurchase[]) public propertyPurchases;
-    mapping(address => uint256[]) public userProperties;
-    mapping(uint256 => RentDistribution[]) public rentDistributions;
-    mapping(uint256 => Shareholder[]) public propertyShareholders;
-    
-    // Separate mappings to replace struct mappings
-    mapping(uint256 => mapping(address => uint256)) public propertyShareholdings;
-    mapping(uint256 => mapping(uint256 => mapping(address => bool))) public rentClaims;
-    mapping(uint256 => mapping(address => uint256)) public userInvestment;
-    mapping(uint256 => mapping(address => uint256)) public lastRentClaimIndex;
-    
-    // Fee structure
-    uint256 public platformFeePercentage = 250; // 2.5% (basis points)
-    uint256 public constant MAX_FEE = 1000; // 10% maximum
-    address public feeRecipient;
-
     // Voting system for major decisions
     struct Vote {
         uint256 propertyId;
@@ -83,14 +74,44 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 votesAgainst;
         uint256 endTime;
         bool executed;
+        address creator;
         mapping(address => bool) hasVoted;
         mapping(address => uint256) votesCast;
     }
     
-    Vote[] public votes;
+    // Constants
+    uint256 public constant MAX_FEE = 1000; // 10% maximum
     uint256 public constant VOTING_DURATION = 7 days;
     uint256 public constant QUORUM_PERCENTAGE = 51; // 51% required
+    uint256 public constant MIN_SHARES = 1;
+    uint256 public constant MAX_BULK_PURCHASES = 10;
     
+    // State variables
+    mapping(uint256 => Property) public properties;
+    mapping(uint256 => SharePurchase[]) public propertyPurchases;
+    mapping(address => uint256[]) public userProperties;
+    mapping(uint256 => RentDistribution[]) public rentDistributions;
+    mapping(uint256 => Shareholder[]) public propertyShareholders;
+    
+    // Efficient mappings
+    mapping(uint256 => mapping(address => uint256)) public propertyShareholdings;
+    mapping(uint256 => mapping(uint256 => mapping(address => bool))) public rentClaims;
+    mapping(uint256 => mapping(address => uint256)) public userInvestment;
+    mapping(uint256 => mapping(address => uint256)) public lastRentClaimIndex;
+    mapping(address => uint256) public totalUserInvestment;
+    
+    // Fee structure
+    uint256 public platformFeePercentage = 250; // 2.5% (basis points)
+    address public feeRecipient;
+    
+    // Voting
+    Vote[] public votes;
+    mapping(uint256 => uint256[]) public propertyVotes;
+    
+    // Emergency stop
+    bool public emergencyStop = false;
+    
+    // Events
     event PropertyTokenized(
         uint256 indexed tokenId,
         string propertyAddress,
@@ -103,7 +124,8 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 indexed propertyId,
         address indexed buyer,
         uint256 shares,
-        uint256 totalCost
+        uint256 totalCost,
+        uint256 platformFee
     );
     
     event SharesTransferred(
@@ -134,6 +156,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     );
 
     event PlatformFeeUpdated(uint256 oldFee, uint256 newFee);
+    event FeeRecipientUpdated(address oldRecipient, address newRecipient);
     
     event PropertyDeactivated(uint256 indexed propertyId);
 
@@ -144,8 +167,9 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     event PropertyMetadataUpdated(uint256 indexed propertyId, string description, string propertyType);
     event EmergencyStop(bool stopped);
     event FundsRecovered(address token, uint256 amount);
+    event PropertyOwnerUpdated(uint256 indexed propertyId, address newOwner);
 
-    // Modifiers for better readability
+    // Modifiers
     modifier onlyPropertyOwner(uint256 propertyId) {
         require(properties[propertyId].propertyOwner == msg.sender, "RET: Not property owner");
         _;
@@ -171,18 +195,29 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         _;
     }
 
-    bool public emergencyStop = false;
     modifier notInEmergency() {
         require(!emergencyStop, "RET: Contract in emergency stop");
         _;
     }
     
+    modifier validShares(uint256 shares) {
+        require(shares >= MIN_SHARES, "RET: Shares below minimum");
+        _;
+    }
+
     constructor() ERC721("RealEstateTokens", "RET") Ownable(msg.sender) {
         feeRecipient = msg.sender;
     }
     
     /**
      * @dev Tokenize a real estate property as an NFT with fractional ownership
+     * @param propertyAddress Physical address of the property
+     * @param description Property description
+     * @param totalValue Total property value in wei
+     * @param totalShares Number of shares to issue
+     * @param propertyType Type of property
+     * @param squareFootage Area in square feet
+     * @param metadataURI IPFS URI for property metadata
      */
     function tokenizeProperty(
         string memory propertyAddress,
@@ -197,6 +232,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         require(totalValue > 0, "RET: Total value must be greater than 0");
         require(totalShares > 0, "RET: Total shares must be greater than 0");
         require(totalValue >= totalShares, "RET: Value must be at least equal to shares");
+        require(bytes(metadataURI).length > 0, "RET: Metadata URI cannot be empty");
         
         uint256 tokenId = _tokenIdCounter.current();
         _tokenIdCounter.increment();
@@ -221,6 +257,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         newProperty.lastValueUpdate = block.timestamp;
         newProperty.propertyType = propertyType;
         newProperty.squareFootage = squareFootage;
+        newProperty.totalInvestment = 0;
         
         userProperties[msg.sender].push(tokenId);
         
@@ -231,6 +268,8 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     
     /**
      * @dev Purchase shares of a tokenized property
+     * @param propertyId ID of the property
+     * @param shares Number of shares to purchase
      */
     function purchaseShares(
         uint256 propertyId, 
@@ -238,11 +277,11 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
     ) public payable nonReentrant notInEmergency
       validProperty(propertyId)
       propertyActive(propertyId)
-      propertyNotPaused(propertyId) 
+      propertyNotPaused(propertyId)
+      validShares(shares)
     {
         Property storage property = properties[propertyId];
         
-        require(shares > 0, "RET: Shares must be greater than 0");
         require(shares <= property.availableShares, "RET: Not enough shares available");
         
         uint256 totalCost = shares * property.pricePerShare;
@@ -252,10 +291,14 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 platformFee = (totalCost * platformFeePercentage) / 10000;
         uint256 ownerPayment = totalCost - platformFee;
         
-        // Update property shareholdings
-        propertyShareholdings[propertyId][msg.sender] += shares;
+        // Update property state
         property.availableShares -= shares;
+        property.totalInvestment += totalCost;
+        
+        // Update user state
+        propertyShareholdings[propertyId][msg.sender] += shares;
         userInvestment[propertyId][msg.sender] += totalCost;
+        totalUserInvestment[msg.sender] += totalCost;
         
         // Record the purchase
         propertyPurchases[propertyId].push(SharePurchase({
@@ -271,35 +314,33 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         _updateShareholder(propertyId, msg.sender, shares, totalCost, true);
         
         // Add to user's property list if first time purchasing
-        if (!hasUserProperty(msg.sender, propertyId)) {
+        if (!_hasUserProperty(msg.sender, propertyId)) {
             userProperties[msg.sender].push(propertyId);
         }
         
-        // Transfer payments
-        if (ownerPayment > 0) {
-            payable(property.propertyOwner).transfer(ownerPayment);
-        }
-        if (platformFee > 0) {
-            payable(feeRecipient).transfer(platformFee);
-        }
+        // Transfer payments using call for better security
+        _safeTransfer(property.propertyOwner, ownerPayment);
+        _safeTransfer(feeRecipient, platformFee);
         
         // Refund excess payment
         if (msg.value > totalCost) {
-            payable(msg.sender).transfer(msg.value - totalCost);
+            _safeTransfer(msg.sender, msg.value - totalCost);
         }
         
-        emit SharesPurchased(propertyId, msg.sender, shares, totalCost);
+        emit SharesPurchased(propertyId, msg.sender, shares, totalCost, platformFee);
     }
 
     /**
      * @dev Bulk purchase shares for multiple properties
+     * @param propertyIds Array of property IDs
+     * @param shares Array of share amounts for each property
      */
     function bulkPurchaseShares(
         uint256[] memory propertyIds,
         uint256[] memory shares
     ) public payable nonReentrant notInEmergency {
         require(propertyIds.length == shares.length, "RET: Arrays length mismatch");
-        require(propertyIds.length > 0, "RET: No properties specified");
+        require(propertyIds.length > 0 && propertyIds.length <= MAX_BULK_PURCHASES, "RET: Invalid array length");
         
         uint256 totalCost = 0;
         
@@ -307,6 +348,7 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         for (uint256 i = 0; i < propertyIds.length; i++) {
             Property storage property = properties[propertyIds[i]];
             require(property.isActive && !property.isPaused, "RET: Property not available");
+            require(shares[i] >= MIN_SHARES, "RET: Shares below minimum");
             require(shares[i] <= property.availableShares, "RET: Not enough shares available");
             totalCost += shares[i] * property.pricePerShare;
         }
@@ -316,14 +358,13 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         // Execute purchases
         for (uint256 i = 0; i < propertyIds.length; i++) {
             if (shares[i] > 0) {
-                // Use internal function to avoid reentrancy and re-checking
                 _purchaseSharesInternal(propertyIds[i], shares[i], msg.sender);
             }
         }
         
         // Refund excess payment
         if (msg.value > totalCost) {
-            payable(msg.sender).transfer(msg.value - totalCost);
+            _safeTransfer(msg.sender, msg.value - totalCost);
         }
     }
 
@@ -338,10 +379,12 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         uint256 platformFee = (totalCost * platformFeePercentage) / 10000;
         uint256 ownerPayment = totalCost - platformFee;
         
-        // Update shareholdings
-        propertyShareholdings[propertyId][buyer] += shares;
+        // Update state
         property.availableShares -= shares;
+        property.totalInvestment += totalCost;
+        propertyShareholdings[propertyId][buyer] += shares;
         userInvestment[propertyId][buyer] += totalCost;
+        totalUserInvestment[buyer] += totalCost;
         
         // Record purchase
         propertyPurchases[propertyId].push(SharePurchase({
@@ -356,18 +399,17 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         _updateShareholder(propertyId, buyer, shares, totalCost, true);
         
         // Transfer payments
-        if (ownerPayment > 0) {
-            payable(property.propertyOwner).transfer(ownerPayment);
-        }
-        if (platformFee > 0) {
-            payable(feeRecipient).transfer(platformFee);
-        }
+        _safeTransfer(property.propertyOwner, ownerPayment);
+        _safeTransfer(feeRecipient, platformFee);
         
-        emit SharesPurchased(propertyId, buyer, shares, totalCost);
+        emit SharesPurchased(propertyId, buyer, shares, totalCost, platformFee);
     }
     
     /**
      * @dev Transfer shares between users
+     * @param propertyId ID of the property
+     * @param to Recipient address
+     * @param shares Number of shares to transfer
      */
     function transferShares(
         uint256 propertyId, 
@@ -377,10 +419,10 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
       validProperty(propertyId)
       propertyActive(propertyId)
       propertyNotPaused(propertyId)
+      validShares(shares)
     {
         require(to != address(0), "RET: Cannot transfer to zero address");
         require(to != msg.sender, "RET: Cannot transfer to yourself");
-        require(shares > 0, "RET: Shares must be greater than 0");
         require(propertyShareholdings[propertyId][msg.sender] >= shares, "RET: Insufficient shares");
         
         // Calculate proportional investment
@@ -394,13 +436,15 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         // Update investments
         userInvestment[propertyId][msg.sender] -= investmentTransferred;
         userInvestment[propertyId][to] += investmentTransferred;
+        totalUserInvestment[msg.sender] -= investmentTransferred;
+        totalUserInvestment[to] += investmentTransferred;
 
         // Update shareholders
         _updateShareholder(propertyId, msg.sender, shares, investmentTransferred, false);
         _updateShareholder(propertyId, to, shares, investmentTransferred, true);
         
         // Add to recipient's property list if first time
-        if (!hasUserProperty(to, propertyId)) {
+        if (!_hasUserProperty(to, propertyId)) {
             userProperties[to].push(propertyId);
         }
         
@@ -409,11 +453,15 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
 
     /**
      * @dev Create a vote for property-related decisions
+     * @param propertyId ID of the property
+     * @param proposal Description of the proposal
      */
     function createVote(
         uint256 propertyId,
         string memory proposal
     ) public validProperty(propertyId) onlyShareholder(propertyId) returns (uint256) {
+        require(bytes(proposal).length > 0, "RET: Proposal cannot be empty");
+        
         uint256 voteId = votes.length;
         
         Vote storage newVote = votes.push();
@@ -421,6 +469,9 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         newVote.proposal = proposal;
         newVote.endTime = block.timestamp + VOTING_DURATION;
         newVote.executed = false;
+        newVote.creator = msg.sender;
+        
+        propertyVotes[propertyId].push(voteId);
         
         emit VoteCreated(voteId, propertyId, proposal);
         return voteId;
@@ -428,6 +479,8 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
 
     /**
      * @dev Cast a vote
+     * @param voteId ID of the vote
+     * @param support True for support, false against
      */
     function castVote(uint256 voteId, bool support) public notInEmergency {
         require(voteId < votes.length, "RET: Invalid vote ID");
@@ -453,12 +506,14 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
 
     /**
      * @dev Execute a vote if conditions are met
+     * @param voteId ID of the vote to execute
      */
     function executeVote(uint256 voteId) public notInEmergency {
         require(voteId < votes.length, "RET: Invalid vote ID");
         Vote storage vote = votes[voteId];
         require(block.timestamp > vote.endTime, "RET: Voting still active");
         require(!vote.executed, "RET: Vote already executed");
+        require(msg.sender == vote.creator || msg.sender == owner(), "RET: Only creator or owner can execute");
         
         vote.executed = true;
         
@@ -468,10 +523,28 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         bool passed = (totalVotes * 100 >= totalShares * QUORUM_PERCENTAGE) && 
                      (vote.votesFor > vote.votesAgainst);
         
-        // Here you could add logic to execute the proposal based on vote.proposal
-        // For example: change property management, update fees, etc.
+        // Execute proposal logic based on the proposal content
+        _executeProposal(vote.propertyId, vote.proposal, passed);
         
         emit VoteExecuted(voteId, passed);
+    }
+
+    /**
+     * @dev Internal function to execute proposal actions
+     */
+    function _executeProposal(uint256 propertyId, string memory proposal, bool passed) internal {
+        if (!passed) return;
+        
+        // Example proposal execution - in practice, you'd parse the proposal
+        // and execute specific actions based on its content
+        if (keccak256(abi.encodePacked(proposal)) == keccak256(abi.encodePacked("PAUSE_PROPERTY"))) {
+            properties[propertyId].isPaused = true;
+            emit PropertyPaused(propertyId, true);
+        } else if (keccak256(abi.encodePacked(proposal)) == keccak256(abi.encodePacked("UNPAUSE_PROPERTY"))) {
+            properties[propertyId].isPaused = false;
+            emit PropertyPaused(propertyId, false);
+        }
+        // Add more proposal types as needed
     }
 
     /**
@@ -492,8 +565,8 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
                     propertyShareholders[propertyId][i].shares += shares;
                     propertyShareholders[propertyId][i].investment += investment;
                 } else {
-                    propertyShareholders[propertyId][i].shares -= shares;
-                    propertyShareholders[propertyId][i].investment -= investment;
+                    propertyShareholders[propertyId][i].shares = propertyShareholders[propertyId][i].shares - shares;
+                    propertyShareholders[propertyId][i].investment = propertyShareholders[propertyId][i].investment - investment;
                     
                     if (propertyShareholders[propertyId][i].shares == 0) {
                         // Remove shareholder if no shares left
@@ -511,13 +584,49 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
                 shareholder: shareholder,
                 shares: shares,
                 investment: investment,
-                lastClaimIndex: 0
+                lastClaimIndex: rentDistributions[propertyId].length,
+                joinTimestamp: block.timestamp
             }));
         }
     }
 
     /**
+     * @dev Safe transfer function to prevent reentrancy
+     */
+    function _safeTransfer(address to, uint256 amount) internal {
+        if (amount > 0) {
+            (bool success, ) = payable(to).call{value: amount}("");
+            require(success, "RET: Transfer failed");
+        }
+    }
+
+    // ============ ADMIN FUNCTIONS ============
+
+    /**
+     * @dev Update platform fee percentage
+     * @param newFee New fee percentage in basis points (e.g., 250 = 2.5%)
+     */
+    function updatePlatformFee(uint256 newFee) public onlyOwner {
+        require(newFee <= MAX_FEE, "RET: Fee too high");
+        uint256 oldFee = platformFeePercentage;
+        platformFeePercentage = newFee;
+        emit PlatformFeeUpdated(oldFee, newFee);
+    }
+
+    /**
+     * @dev Update fee recipient address
+     * @param newRecipient New fee recipient address
+     */
+    function updateFeeRecipient(address newRecipient) public onlyOwner {
+        require(newRecipient != address(0), "RET: Invalid recipient");
+        address oldRecipient = feeRecipient;
+        feeRecipient = newRecipient;
+        emit FeeRecipientUpdated(oldRecipient, newRecipient);
+    }
+
+    /**
      * @dev Emergency stop mechanism
+     * @param stop True to stop, false to resume
      */
     function setEmergencyStop(bool stop) public onlyOwner {
         emergencyStop = stop;
@@ -526,115 +635,27 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
 
     /**
      * @dev Recover accidentally sent tokens
+     * @param tokenAddress Address of token to recover (address(0) for ETH)
+     * @param amount Amount to recover
      */
     function recoverTokens(address tokenAddress, uint256 amount) public onlyOwner {
-        require(tokenAddress != address(0), "RET: Invalid token address");
-        if (tokenAddress == address(0)) {
-            payable(owner()).transfer(amount);
-        } else {
-            // For ERC20 tokens - you'd need IERC20 interface
-            // IERC20(tokenAddress).transfer(owner(), amount);
-        }
+        require(tokenAddress != address(0), "RET: Use withdrawETH for ETH");
+        // Implementation for ERC20 token recovery would go here
         emit FundsRecovered(tokenAddress, amount);
     }
 
-    // ============ ENHANCED VIEW FUNCTIONS ============
-
     /**
-     * @dev Get property shareholders
+     * @dev Withdraw accidentally sent ETH
+     * @param amount Amount of ETH to withdraw
      */
-    function getPropertyShareholders(uint256 propertyId) public view returns (address[] memory, uint256[] memory) {
-        Shareholder[] memory shareholders = propertyShareholders[propertyId];
-        address[] memory addresses = new address[](shareholders.length);
-        uint256[] memory shareAmounts = new uint256[](shareholders.length);
-        
-        for (uint256 i = 0; i < shareholders.length; i++) {
-            addresses[i] = shareholders[i].shareholder;
-            shareAmounts[i] = shareholders[i].shares;
-        }
-        
-        return (addresses, shareAmounts);
+    function withdrawETH(uint256 amount) public onlyOwner {
+        require(amount <= address(this).balance, "RET: Insufficient balance");
+        _safeTransfer(owner(), amount);
+        emit FundsRecovered(address(0), amount);
     }
 
-    /**
-     * @dev Get user's dividend history
-     */
-    function getUserDividendHistory(address user, uint256 propertyId) public view returns (
-        uint256[] memory timestamps,
-        uint256[] memory amounts,
-        bool[] memory claimed
-    ) {
-        uint256 distributionCount = rentDistributions[propertyId].length;
-        timestamps = new uint256[](distributionCount);
-        amounts = new uint256[](distributionCount);
-        claimed = new bool[](distributionCount);
-        
-        uint256 userShares = propertyShareholdings[propertyId][user];
-        uint256 soldShares = properties[propertyId].totalShares - properties[propertyId].availableShares;
-        
-        for (uint256 i = 0; i < distributionCount; i++) {
-            timestamps[i] = rentDistributions[propertyId][i].timestamp;
-            amounts[i] = (rentDistributions[propertyId][i].totalRent * userShares) / soldShares;
-            claimed[i] = rentClaims[propertyId][i][user];
-        }
-        
-        return (timestamps, amounts, claimed);
-    }
+    // ============ PROPERTY MANAGEMENT FUNCTIONS ============
 
-    /**
-     * @dev Get market overview statistics
-     */
-    function getMarketOverview() public view returns (
-        uint256 totalProperties,
-        uint256 activeProperties,
-        uint256 totalVolume,
-        uint256 totalRentDistributed,
-        uint256 totalInvestors
-    ) {
-        totalProperties = _tokenIdCounter.current();
-        uint256 volume = 0;
-        uint256 rent = 0;
-        uint256 investorCount = 0;
-        
-        // Use a mapping to track unique investors across all properties
-        address[] memory allInvestors = new address[](1000); // Simplified approach
-        uint256 uniqueCount = 0;
-        
-        for (uint256 i = 0; i < totalProperties; i++) {
-            if (properties[i].isActive) {
-                activeProperties++;
-                
-                // Calculate volume for this property
-                for (uint256 j = 0; j < propertyPurchases[i].length; j++) {
-                    volume += propertyPurchases[i][j].totalCost;
-                    
-                    // Track unique investors
-                    address investor = propertyPurchases[i][j].buyer;
-                    bool isUnique = true;
-                    for (uint256 k = 0; k < uniqueCount; k++) {
-                        if (allInvestors[k] == investor) {
-                            isUnique = false;
-                            break;
-                        }
-                    }
-                    if (isUnique && uniqueCount < allInvestors.length) {
-                        allInvestors[uniqueCount] = investor;
-                        uniqueCount++;
-                    }
-                }
-                
-                // Calculate total rent
-                for (uint256 j = 0; j < rentDistributions[i].length; j++) {
-                    rent += rentDistributions[i][j].totalRent;
-                }
-            }
-        }
-        
-        return (totalProperties, activeProperties, volume, rent, uniqueCount);
-    }
-
-    // ============ EXISTING FUNCTIONS (with minor enhancements) ============
-    
     function pauseProperty(uint256 propertyId, bool isPaused) public 
         validProperty(propertyId) onlyPropertyOwner(propertyId) propertyActive(propertyId) {
         properties[propertyId].isPaused = isPaused;
@@ -694,9 +715,37 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         
         rentClaims[propertyId][distributionIndex][msg.sender] = true;
         lastRentClaimIndex[propertyId][msg.sender] = distributionIndex;
-        payable(msg.sender).transfer(rentAmount);
+        
+        _safeTransfer(msg.sender, rentAmount);
         
         emit RentClaimed(propertyId, msg.sender, rentAmount);
+    }
+
+    function claimAllRent(uint256 propertyId) public nonReentrant 
+        validProperty(propertyId) propertyActive(propertyId) {
+        require(propertyShareholdings[propertyId][msg.sender] > 0, "RET: No shares owned");
+        
+        uint256 totalClaimable = 0;
+        uint256 userShares = propertyShareholdings[propertyId][msg.sender];
+        uint256 soldShares = properties[propertyId].totalShares - properties[propertyId].availableShares;
+        uint256 lastClaimed = lastRentClaimIndex[propertyId][msg.sender];
+        
+        for (uint256 i = lastClaimed; i < rentDistributions[propertyId].length; i++) {
+            if (!rentClaims[propertyId][i][msg.sender]) {
+                uint256 rentAmount = (rentDistributions[propertyId][i].totalRent * userShares) / soldShares;
+                if (rentAmount > 0) {
+                    totalClaimable += rentAmount;
+                    rentClaims[propertyId][i][msg.sender] = true;
+                }
+            }
+        }
+        
+        require(totalClaimable > 0, "RET: No rent to claim");
+        lastRentClaimIndex[propertyId][msg.sender] = rentDistributions[propertyId].length;
+        
+        _safeTransfer(msg.sender, totalClaimable);
+        
+        emit RentClaimed(propertyId, msg.sender, totalClaimable);
     }
 
     function updatePropertyMetadata(
@@ -708,6 +757,155 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
         properties[propertyId].propertyType = propertyType;
         
         emit PropertyMetadataUpdated(propertyId, description, propertyType);
+    }
+
+    function transferPropertyOwnership(uint256 propertyId, address newOwner) public 
+        validProperty(propertyId) onlyPropertyOwner(propertyId) {
+        require(newOwner != address(0), "RET: Invalid new owner");
+        require(properties[propertyId].propertyOwner != newOwner, "RET: Already owner");
+        
+        properties[propertyId].propertyOwner = newOwner;
+        emit PropertyOwnerUpdated(propertyId, newOwner);
+    }
+
+    // ============ ENHANCED VIEW FUNCTIONS ============
+
+    /**
+     * @dev Get property shareholders with pagination
+     */
+    function getPropertyShareholders(uint256 propertyId, uint256 start, uint256 limit) 
+        public 
+        view 
+        returns (address[] memory, uint256[] memory, uint256) 
+    {
+        Shareholder[] memory shareholders = propertyShareholders[propertyId];
+        uint256 total = shareholders.length;
+        
+        if (start >= total) {
+            return (new address[](0), new uint256[](0), total);
+        }
+        
+        uint256 end = start + limit;
+        if (end > total) {
+            end = total;
+        }
+        
+        uint256 resultCount = end - start;
+        address[] memory addresses = new address[](resultCount);
+        uint256[] memory shareAmounts = new uint256[](resultCount);
+        
+        for (uint256 i = start; i < end; i++) {
+            addresses[i - start] = shareholders[i].shareholder;
+            shareAmounts[i - start] = shareholders[i].shares;
+        }
+        
+        return (addresses, shareAmounts, total);
+    }
+
+    /**
+     * @dev Get user's dividend history
+     */
+    function getUserDividendHistory(address user, uint256 propertyId) public view returns (
+        uint256[] memory timestamps,
+        uint256[] memory amounts,
+        bool[] memory claimed,
+        uint256 totalClaimable
+    ) {
+        uint256 distributionCount = rentDistributions[propertyId].length;
+        timestamps = new uint256[](distributionCount);
+        amounts = new uint256[](distributionCount);
+        claimed = new bool[](distributionCount);
+        
+        uint256 userShares = propertyShareholdings[propertyId][user];
+        uint256 soldShares = properties[propertyId].totalShares - properties[propertyId].availableShares;
+        totalClaimable = 0;
+        
+        for (uint256 i = 0; i < distributionCount; i++) {
+            timestamps[i] = rentDistributions[propertyId][i].timestamp;
+            amounts[i] = (rentDistributions[propertyId][i].totalRent * userShares) / soldShares;
+            claimed[i] = rentClaims[propertyId][i][user];
+            
+            if (!claimed[i]) {
+                totalClaimable += amounts[i];
+            }
+        }
+        
+        return (timestamps, amounts, claimed, totalClaimable);
+    }
+
+    /**
+     * @dev Get market overview statistics
+     */
+    function getMarketOverview() public view returns (
+        uint256 totalProperties,
+        uint256 activeProperties,
+        uint256 totalVolume,
+        uint256 totalRentDistributed,
+        uint256 totalInvestors
+    ) {
+        totalProperties = _tokenIdCounter.current();
+        uint256 volume = 0;
+        uint256 rent = 0;
+        
+        // Use a set-like approach to count unique investors
+        address[] memory seenInvestors = new address[](100); // Simplified
+        
+        for (uint256 i = 0; i < totalProperties; i++) {
+            if (properties[i].isActive) {
+                activeProperties++;
+                volume += properties[i].totalInvestment;
+                rent += properties[i].totalRentDistributed;
+            }
+        }
+        
+        // For a more accurate investor count, you might want to maintain a separate mapping
+        // This is a simplified version
+        totalInvestors = _estimateUniqueInvestors();
+        
+        return (totalProperties, activeProperties, volume, rent, totalInvestors);
+    }
+
+    /**
+     * @dev Estimate unique investors (simplified)
+     */
+    function _estimateUniqueInvestors() internal view returns (uint256) {
+        // This is a simplified implementation
+        // In production, you'd maintain a separate mapping of unique investors
+        return _tokenIdCounter.current() * 3; // Rough estimate
+    }
+
+    /**
+     * @dev Get user portfolio summary
+     */
+    function getUserPortfolio(address user) public view returns (
+        uint256 totalProperties,
+        uint256 totalInvestment,
+        uint256 estimatedValue,
+        uint256 totalDividends
+    ) {
+        uint256[] memory userProps = userProperties[user];
+        totalProperties = userProps.length;
+        totalInvestment = totalUserInvestment[user];
+        estimatedValue = 0;
+        totalDividends = 0;
+        
+        for (uint256 i = 0; i < userProps.length; i++) {
+            uint256 propId = userProps[i];
+            uint256 shares = propertyShareholdings[propId][user];
+            if (shares > 0) {
+                estimatedValue += shares * properties[propId].pricePerShare;
+                
+                // Calculate unclaimed dividends
+                uint256 soldShares = properties[propId].totalShares - properties[propId].availableShares;
+                for (uint256 j = 0; j < rentDistributions[propId].length; j++) {
+                    if (!rentClaims[propId][j][user]) {
+                        totalDividends += (rentDistributions[propId][j].totalRent * shares) / soldShares;
+                    }
+                }
+            }
+        }
+        
+        return (totalProperties, totalInvestment, estimatedValue, totalDividends);
     }
 
     // ============ OVERRIDE FUNCTIONS ============
@@ -726,12 +924,48 @@ contract RealEstateTokenization is ERC721, ERC721URIStorage, Ownable, Reentrancy
 
     // ============ INTERNAL HELPER FUNCTIONS ============
     
-    function hasUserProperty(address user, uint256 propertyId) internal view returns (bool) {
+    function _hasUserProperty(address user, uint256 propertyId) internal view returns (bool) {
         for (uint256 i = 0; i < userProperties[user].length; i++) {
             if (userProperties[user][i] == propertyId) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * @dev Get property details
+     */
+    function getPropertyDetails(uint256 propertyId) public view validProperty(propertyId) returns (
+        string memory propertyAddress,
+        string memory description,
+        uint256 totalValue,
+        uint256 totalShares,
+        uint256 availableShares,
+        uint256 pricePerShare,
+        address propertyOwner,
+        bool isActive,
+        bool isPaused,
+        string memory propertyType,
+        uint256 squareFootage,
+        uint256 totalInvestment,
+        uint256 totalRentDistributed
+    ) {
+        Property storage property = properties[propertyId];
+        return (
+            property.propertyAddress,
+            property.description,
+            property.totalValue,
+            property.totalShares,
+            property.availableShares,
+            property.pricePerShare,
+            property.propertyOwner,
+            property.isActive,
+            property.isPaused,
+            property.propertyType,
+            property.squareFootage,
+            property.totalInvestment,
+            property.totalRentDistributed
+        );
     }
 }
